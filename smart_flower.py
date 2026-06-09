@@ -303,40 +303,49 @@ class FlowerEngine(KnowledgeEngine):
         self._spawn(pos, Bag.make(new_load_dict), Bag.make(new_needs_dict),
                     g+1, f"unload@{pid}", nid)
 
+    # -----------------------------------------------------------------------
+    # Goal check
+    # -----------------------------------------------------------------------
+
+    @Rule(
+        State(status="open", nid=MATCH.nid, g=MATCH.g,
+              load=MATCH.load, needs=MATCH.needs),
+        TEST(lambda load, needs: not load and not needs),
+        salience=10,   # fire before generators (salience=0) on same state
+    )
+    def goal_check(self, nid, g, load, needs):
+        path = []
+        cur = nid
+        while cur is not None:
+            node = self._nodes[cur]
+            path.append((node["op"], node["pos"], node["g"]))
+            cur = node["parent"]
+        path.reverse()
+        print("\n=== SOLUTION ===")
+        for op, pos, cost in path:
+            print(f"  g={cost:3d}  {op}  @{pos}")
+        print(f"Total cost: {g}")
+        self.halt()
+
 
 # ---------------------------------------------------------------------------
-# Smoke-test  (Milestone 2 check)
+# Smoke-test  (Milestone 3 check)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    instance_A = {
-        "grid":        (5, 5),
+    # Tiny instance: 2-column, 1-row grid.  Only valid cells: (0,0) and (1,0).
+    # Optimal path: start → load → move-right → unload@P1   (cost = 3)
+    tiny = {
+        "grid":        (2, 1),
         "warehouse":   (0, 0),
         "robot_start": (0, 0),
         "pavilions": {
-            "P1": {"type": "rose", "pos": (3, 2), "needs": {"red": 2}},
+            "P1": {"type": "rose", "pos": (1, 0), "needs": {"red": 1}},
         },
     }
 
-    print("=== Milestone 2: root expansion (halt after 12 generated nodes) ===")
+    print("=== Milestone 3: goal check on tiny instance ===")
+    print("DFS finds first valid path (not optimal). Path/cost must be self-consistent.\n")
+    print("Generated states:")
     engine = FlowerEngine()
-    engine.reset(instance_A)
-
-    # Manually expand just the root so we can inspect its direct children
-    # without running the full DFS.
-    root_nid = 1
-    root = engine._nodes[root_nid]
-    pos   = root["pos"]
-    load  = root["load"]
-    needs = root["needs"]
-    g     = root["g"]
-
-    print(f"\nRoot: pos={pos}  load={fmt_bag(load)}  needs={fmt_bag(needs)}  g={g}")
-    print("\nChildren of root:")
-    for dx, dy, op in [(1,0,"move-right"),(-1,0,"move-left"),(0,1,"move-up"),(0,-1,"move-down")]:
-        engine._spawn((pos[0]+dx, pos[1]+dy), load, needs, g+1, op, root_nid)
-    if pos == engine._warehouse and not load and needs:
-        for candidate in engine._candidate_loads(needs):
-            engine._spawn(pos, candidate, needs, g+1, "load", root_nid)
-
-    print(f"\nTotal nodes in memory (root + children): {len(engine._nodes)}")
-    print(f"Seen set size: {len(engine._seen)}")
+    engine.reset(tiny)
+    engine.run()
