@@ -1,4 +1,5 @@
 from experta import *
+import math
 
 # ---------------------------------------------------------------------------
 # CATALOG  (static: type → set of colors available for that type)
@@ -14,14 +15,10 @@ CATALOG = {
 # Bag  — immutable, hashable mapping used for both loads and pavilion needs
 # ---------------------------------------------------------------------------
 class Bag(frozenset):
-    """
-    A frozen multiset of (key, qty) pairs.
-    Use Bag.make({key: qty, ...}) to build one.
-    """
+    """Frozen multiset of (key, qty) pairs. Use Bag.make({key: qty}) to build."""
 
     @classmethod
     def make(cls, mapping):
-        """Build a Bag from a plain dict, dropping zero/falsy entries."""
         return cls((k, v) for k, v in mapping.items() if v)
 
     def to_dict(self):
@@ -42,7 +39,7 @@ class Bag(frozenset):
 
 
 def fmt_bag(fs):
-    """Format any frozenset-of-(key,val)-pairs as a Bag repr (Experta strips subclass)."""
+    """Format any frozenset-of-(key,val)-pairs as Bag repr (Experta strips subclass)."""
     return Bag.__repr__(fs)
 
 
@@ -50,26 +47,17 @@ def fmt_bag(fs):
 # Facts
 # ---------------------------------------------------------------------------
 class World(Fact):
-    """
-    Static grid info — declared once, never modified.
-    Fields: width, height, warehouse (x,y), max_load,
-            pavilions {id: {"type": t, "pos": (x,y)}}
-    """
+    """Static grid info: width, height, warehouse, max_load, pavilions."""
     pass
 
 
 class State(Fact):
     """
     One search-tree node.
-    Fields:
-        pos    (x, y)
-        load   Bag  {(type, color): qty}
-        needs  Bag  {pavilion_id: Bag{color: qty}}   — remaining needs per pavilion
-        g      int  cost so far
-        op     str  operation that produced this node
-        parent int  nid of parent node (None for root)
-        nid    int  unique node id
-        status str  'open' | 'current' | 'closed'
+    pos, load, needs  — semantic state
+    g                 — cost so far
+    op, parent, nid   — bookkeeping
+    status            — 'open' | 'current' | 'closed'
     """
     pass
 
@@ -88,7 +76,7 @@ def _next_nid():
 
 class FlowerEngine(KnowledgeEngine):
 
-    def reset(self, instance):
+    def reset(self, instance, mode="dfs"):
         """
         instance = {
             "grid":        (width, height),
@@ -96,19 +84,22 @@ class FlowerEngine(KnowledgeEngine):
             "robot_start": (sx, sy),
             "pavilions":   {id: {"type": t, "pos": (x,y), "needs": {color: qty}}}
         }
+        mode = "dfs" | "astar"
         """
         global _nid_counter
         _nid_counter = 0
 
+        self._mode      = mode
+        self._verbose   = True  # set False to suppress per-node prints
         self._instance  = instance
-        self._nodes     = {}   # nid → State fact
-        self._seen      = {}   # (pos, load, needs) → best_g
+        self._nodes     = {}    # nid → State fact
+        self._seen      = {}    # (pos, load, needs) → best_g
 
         max_load = max(
             sum(d["needs"].values())
             for d in instance["pavilions"].values()
         )
-        self._max_load  = max_load
+        self._max_load = max_load
 
         self._pav_table = {
             pid: {"type": d["type"], "pos": d["pos"]}
@@ -120,6 +111,7 @@ class FlowerEngine(KnowledgeEngine):
 
         super().reset()
 
+        self.declare(Fact(mode=mode))           # used by mode-specific rules
         self.declare(World(
             width=self._width,
             height=self._height,
@@ -132,11 +124,10 @@ class FlowerEngine(KnowledgeEngine):
             pid: Bag.make(d["needs"])
             for pid, d in instance["pavilions"].items()
         })
-        root_load = Bag.make({})
         nid = _next_nid()
         root = self.declare(State(
             pos=instance["robot_start"],
-            load=root_load,
+            load=Bag.make({}),
             needs=root_needs,
             g=0,
             op="start",
@@ -147,11 +138,46 @@ class FlowerEngine(KnowledgeEngine):
         self._nodes[nid] = root
 
     # -----------------------------------------------------------------------
-    # Helpers
+    # Heuristic  h(n) = LB_unload + LB_load + LB_move
+    # -----------------------------------------------------------------------
+
+    def _h(self, pos, load, needs):
+        if not needs:
+            return 0
+
+        warehouse  = self._warehouse
+        max_load   = self._max_load
+        load_dict  = dict(load)   # (type, color) → qty
+
+        # Aggregate total needed per (type, color) across all pavilions
+        needed_tc = {}
+        for pid, color_bag in needs:
+            ptype = self._pav_table[pid]["type"]
+            for color, qty in color_bag:
+                key = (ptype, color)
+                needed_tc[key] = needed_tc.get(key, 0) + qty
+
+        total_needed = sum(needed_tc.values())
+        # How much of the current load is actually useful toward those needs
+        useful = sum(min(load_dict.get(k, 0), v) for k, v in needed_tc.items())
+        not_carried = max(0, total_needed - useful)
+
+        lb_unload = len(dict(needs))                                    # one unload per unsatisfied pavilion
+        lb_load   = math.ceil(not_carried / max_load) if not_carried else 0  # ceil(uncarried / cap)
+
+        # Mandatory visit targets: every unsatisfied pavilion + warehouse if more loads needed
+        targets = [self._pav_table[pid]["pos"] for pid, _ in needs]
+        if lb_load > 0:
+            targets.append(warehouse)
+        lb_move = max(abs(pos[0]-t[0]) + abs(pos[1]-t[1]) for t in targets)
+
+        return lb_unload + lb_load + lb_move
+
+    # -----------------------------------------------------------------------
+    # spawn helper
     # -----------------------------------------------------------------------
 
     def _spawn(self, pos, load, needs, g, op, parent):
-        """Declare a child State if in-bounds and not already dominated in seen."""
         x, y = pos
         if not (0 <= x < self._width and 0 <= y < self._height):
             return
@@ -165,12 +191,17 @@ class FlowerEngine(KnowledgeEngine):
             op=op, parent=parent, nid=nid, status="open",
         ))
         self._nodes[nid] = fact
-        print(f"  [{nid}] parent={parent}  op={op}  pos={pos}  g={g}"
-              f"  load={fmt_bag(load)}  needs={fmt_bag(needs)}")
+        if self._verbose:
+            h = self._h(pos, load, needs)
+            print(f"  [{nid}] parent={parent}  op={op}  pos={pos}"
+                  f"  g={g}  h={h}  f={g+h}"
+                  f"  load={fmt_bag(load)}  needs={fmt_bag(needs)}")
+
+    # -----------------------------------------------------------------------
+    # Load candidates helper
+    # -----------------------------------------------------------------------
 
     def _candidate_loads(self, needs_fs):
-        """Yield candidate load Bags: Option B (per-type) + Option A (cross-type, multi-type colors only)."""
-        # Aggregate what's still needed: (type, color) → total_qty
         agg = {}
         for pid, color_bag in needs_fs:
             ptype = self._pav_table[pid]["type"]
@@ -181,7 +212,7 @@ class FlowerEngine(KnowledgeEngine):
         max_load = self._max_load
         seen = set()
 
-        # Option B: per flower type — bundle all needed colors of that type
+        # Option B: per type — all needed colors of that type
         by_type = {}
         for (ft, c), q in agg.items():
             by_type.setdefault(ft, []).append((c, q))
@@ -198,8 +229,7 @@ class FlowerEngine(KnowledgeEngine):
                     seen.add(bag)
                     yield bag
 
-        # Option A: per color — 1 unit per type (cross-type sharing)
-        # Only when ≥2 types need the same color (otherwise Option B already covers it)
+        # Option A: per color — 1 unit per type (cross-type sharing, ≥2 types)
         by_color = {}
         for (ft, c), _ in agg.items():
             by_color.setdefault(c, []).append(ft)
@@ -220,43 +250,67 @@ class FlowerEngine(KnowledgeEngine):
                     yield bag
 
     # -----------------------------------------------------------------------
-    # Successor rules
+    # Goal check (salience 30) — fires before generators on goal states
     # -----------------------------------------------------------------------
 
-    @Rule(State(status="open", pos=MATCH.pos, load=MATCH.load,
-                needs=MATCH.needs, g=MATCH.g, nid=MATCH.nid))
+    @Rule(
+        State(status="current", nid=MATCH.nid, g=MATCH.g,
+              load=MATCH.load, needs=MATCH.needs),
+        TEST(lambda load, needs: not load and not needs),
+        salience=30,
+    )
+    def goal_check(self, nid, g, load, needs):
+        path = []
+        cur = nid
+        while cur is not None:
+            node = self._nodes[cur]
+            path.append((node["op"], node["pos"], node["g"]))
+            cur = node["parent"]
+        path.reverse()
+        print("\n=== SOLUTION ===")
+        for op, pos, cost in path:
+            print(f"  g={cost:3d}  {op}  @{pos}")
+        print(f"Total cost: {g}")
+        self.halt()
+
+    # -----------------------------------------------------------------------
+    # Generators (salience 20) — expand whichever state is current
+    # -----------------------------------------------------------------------
+
+    @Rule(State(status="current", pos=MATCH.pos, load=MATCH.load,
+                needs=MATCH.needs, g=MATCH.g, nid=MATCH.nid), salience=20)
     def move_right(self, pos, load, needs, g, nid):
         self._spawn((pos[0]+1, pos[1]), load, needs, g+1, "move-right", nid)
 
-    @Rule(State(status="open", pos=MATCH.pos, load=MATCH.load,
-                needs=MATCH.needs, g=MATCH.g, nid=MATCH.nid))
+    @Rule(State(status="current", pos=MATCH.pos, load=MATCH.load,
+                needs=MATCH.needs, g=MATCH.g, nid=MATCH.nid), salience=20)
     def move_left(self, pos, load, needs, g, nid):
         self._spawn((pos[0]-1, pos[1]), load, needs, g+1, "move-left", nid)
 
-    @Rule(State(status="open", pos=MATCH.pos, load=MATCH.load,
-                needs=MATCH.needs, g=MATCH.g, nid=MATCH.nid))
+    @Rule(State(status="current", pos=MATCH.pos, load=MATCH.load,
+                needs=MATCH.needs, g=MATCH.g, nid=MATCH.nid), salience=20)
     def move_up(self, pos, load, needs, g, nid):
         self._spawn((pos[0], pos[1]+1), load, needs, g+1, "move-up", nid)
 
-    @Rule(State(status="open", pos=MATCH.pos, load=MATCH.load,
-                needs=MATCH.needs, g=MATCH.g, nid=MATCH.nid))
+    @Rule(State(status="current", pos=MATCH.pos, load=MATCH.load,
+                needs=MATCH.needs, g=MATCH.g, nid=MATCH.nid), salience=20)
     def move_down(self, pos, load, needs, g, nid):
         self._spawn((pos[0], pos[1]-1), load, needs, g+1, "move-down", nid)
 
-    @Rule(State(status="open", pos=MATCH.pos, load=MATCH.load,
-                needs=MATCH.needs, g=MATCH.g, nid=MATCH.nid))
+    @Rule(State(status="current", pos=MATCH.pos, load=MATCH.load,
+                needs=MATCH.needs, g=MATCH.g, nid=MATCH.nid), salience=20)
     def load_rule(self, pos, load, needs, g, nid):
         if pos != self._warehouse:
             return
-        if load:          # must be empty-handed
+        if load:
             return
-        if not needs:     # nothing left to deliver
+        if not needs:
             return
         for candidate in self._candidate_loads(needs):
             self._spawn(pos, candidate, needs, g+1, "load", nid)
 
-    @Rule(State(status="open", pos=MATCH.pos, load=MATCH.load,
-                needs=MATCH.needs, g=MATCH.g, nid=MATCH.nid))
+    @Rule(State(status="current", pos=MATCH.pos, load=MATCH.load,
+                needs=MATCH.needs, g=MATCH.g, nid=MATCH.nid), salience=20)
     def unload_rule(self, pos, load, needs, g, nid):
         if not load:
             return
@@ -269,7 +323,7 @@ class FlowerEngine(KnowledgeEngine):
         needs_dict = dict(needs)
         pav_bag    = needs_dict.get(pid)
         if pav_bag is None:
-            return   # pavilion already satisfied
+            return
 
         pav_needs = dict(pav_bag)
         load_dict = dict(load)
@@ -304,50 +358,134 @@ class FlowerEngine(KnowledgeEngine):
                     g+1, f"unload@{pid}", nid)
 
     # -----------------------------------------------------------------------
-    # Goal check
+    # Close current (salience 10)
+    # -----------------------------------------------------------------------
+
+    @Rule(AS.state_fact << State(status="current"), salience=10)
+    def close_current(self, state_fact):
+        self.modify(state_fact, status="closed")
+
+    # -----------------------------------------------------------------------
+    # DFS control: promote most-recently-declared open state (salience 5)
     # -----------------------------------------------------------------------
 
     @Rule(
-        State(status="open", nid=MATCH.nid, g=MATCH.g,
-              load=MATCH.load, needs=MATCH.needs),
-        TEST(lambda load, needs: not load and not needs),
-        salience=10,   # fire before generators (salience=0) on same state
+        AS.state_fact << State(status="open"),
+        NOT(State(status="current")),
+        Fact(mode="dfs"),
+        salience=5,
     )
-    def goal_check(self, nid, g, load, needs):
-        path = []
-        cur = nid
-        while cur is not None:
-            node = self._nodes[cur]
-            path.append((node["op"], node["pos"], node["g"]))
-            cur = node["parent"]
-        path.reverse()
-        print("\n=== SOLUTION ===")
-        for op, pos, cost in path:
-            print(f"  g={cost:3d}  {op}  @{pos}")
-        print(f"Total cost: {g}")
-        self.halt()
+    def dfs_promote(self, state_fact):
+        self.modify(state_fact, status="current")
+
+    # -----------------------------------------------------------------------
+    # A* control: promote min-f open state (salience 0)
+    # -----------------------------------------------------------------------
+
+    @Rule(
+        NOT(State(status="current")),
+        Fact(mode="astar"),
+        salience=0,
+    )
+    def select_best(self):
+        best_fact, best_f = None, float("inf")
+        for fact in self.facts.values():
+            if isinstance(fact, State) and fact["status"] == "open":
+                h = self._h(fact["pos"], fact["load"], fact["needs"])
+                f = fact["g"] + h
+                # tie-break: prefer deeper node (higher g) to reduce open-set scanning
+                if f < best_f or (f == best_f and best_fact is not None
+                                  and fact["g"] > best_fact["g"]):
+                    best_f = f
+                    best_fact = fact
+        if best_fact is None:
+            print("No solution found.")
+            self.halt()
+        else:
+            self.modify(best_fact, status="current")
 
 
 # ---------------------------------------------------------------------------
-# Smoke-test  (Milestone 3 check)
+# Instances
+# ---------------------------------------------------------------------------
+
+# Example A: single rose pavilion.  Optimal cost = 6.
+EXAMPLE_A = {
+    "grid":        (5, 5),
+    "warehouse":   (0, 0),
+    "robot_start": (0, 0),
+    "pavilions": {
+        "P1": {"type": "rose", "pos": (2, 2), "needs": {"red": 2}},
+    },
+}
+
+# Example B: P2 tulip + P3 goliat share yellow.  Optimal cost = 9.
+# Optimal: load tulip×2 → P2(1,0) → return → load goliat×2 → P3(3,0)
+EXAMPLE_B = {
+    "grid":        (5, 5),
+    "warehouse":   (0, 0),
+    "robot_start": (0, 0),
+    "pavilions": {
+        "P2": {"type": "tulip",  "pos": (1, 0), "needs": {"yellow": 2}},
+        "P3": {"type": "goliat", "pos": (3, 0), "needs": {"yellow": 2}},
+    },
+}
+
+# 4-Pavilion example: P2+P3 share yellow (Option-A load possible),
+# P1 and P4 use different colors → mixed and single-type trips combined.
+EXAMPLE_4PAV = {
+    "grid":        (5, 3),
+    "warehouse":   (0, 0),
+    "robot_start": (0, 0),
+    "pavilions": {
+        "P1": {"type": "rose",   "pos": (1, 0), "needs": {"red":   2}},
+        "P2": {"type": "tulip",  "pos": (2, 0), "needs": {"yellow": 1}},
+        "P3": {"type": "goliat", "pos": (3, 0), "needs": {"yellow": 1}},
+        "P4": {"type": "rose",   "pos": (4, 0), "needs": {"white":  1}},
+    },
+}
+
+# No-shared-color: P1 needs rose-red, P2 needs tulip-pink — no overlap.
+# Optimal is the N-trip baseline (single-type loads only); mixing never helps.
+# Optimal cost = 4 (trip1: load→P1→back) + 4 (trip2: load→P2) = 8.
+EXAMPLE_NO_SHARED = {
+    "grid":        (5, 1),
+    "warehouse":   (0, 0),
+    "robot_start": (0, 0),
+    "pavilions": {
+        "P1": {"type": "rose",  "pos": (1, 0), "needs": {"red":  2}},
+        "P2": {"type": "tulip", "pos": (2, 0), "needs": {"pink": 2}},
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Helper: run one instance and print a compact result line
+# ---------------------------------------------------------------------------
+def run_instance(name, instance, mode, show_tree=False):
+    print(f"\n{'='*55}")
+    print(f"  {name}  [{mode.upper()}]")
+    print(f"{'='*55}")
+    engine = FlowerEngine()
+    engine.reset(instance, mode=mode)
+    engine._verbose = show_tree
+    engine.run()
+    print(f"  (nodes explored: {len(engine._nodes)})")
+    return engine
+
+
+# ---------------------------------------------------------------------------
+# Smoke-test  (Milestone 7: generality pass)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Example A: single rose pavilion at (2,2).
-    # Optimal cost = 6: load(1) + right×2 + up×2 + unload(1) = 6.
-    # DFS is not optimal — cost may be higher, but solution must be valid.
-    example_A = {
-        "grid":        (5, 5),
-        "warehouse":   (0, 0),
-        "robot_start": (0, 0),
-        "pavilions": {
-            "P1": {"type": "rose", "pos": (2, 2), "needs": {"red": 2}},
-        },
-    }
+    # Example B — already validated; run quickly as a sanity check
+    run_instance("Example B", EXAMPLE_B, "dfs")
+    run_instance("Example B", EXAMPLE_B, "astar")
 
-    print("=== Milestone 4: DFS end-to-end on Example A ===")
-    print("Optimal cost = 6.  DFS cost may be higher.\n")
-    print("--- Search tree ---")
-    engine = FlowerEngine()
-    engine.reset(example_A)
-    engine.run()
-    print(f"\nTotal nodes explored: {len(engine._nodes)}")
+    # 4-Pavilion example
+    run_instance("4-Pavilion", EXAMPLE_4PAV, "dfs")
+    run_instance("4-Pavilion", EXAMPLE_4PAV, "astar")
+
+    # No-shared-color: A* cost must equal the N-trip baseline
+    run_instance("No-shared-color", EXAMPLE_NO_SHARED, "dfs")
+    run_instance("No-shared-color", EXAMPLE_NO_SHARED, "astar")
