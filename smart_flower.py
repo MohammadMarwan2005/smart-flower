@@ -332,20 +332,22 @@ class FlowerEngine(KnowledgeEngine):
 # Smoke-test  (Milestone 3 check)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Tiny instance: 2-column, 1-row grid.  Only valid cells: (0,0) and (1,0).
-    # Optimal path: start → load → move-right → unload@P1   (cost = 3)
-    tiny = {
-        "grid":        (2, 1),
+    # Example A: single rose pavilion at (2,2).
+    # Optimal cost = 6: load(1) + right×2 + up×2 + unload(1) = 6.
+    # DFS is not optimal — cost may be higher, but solution must be valid.
+    example_A = {
+        "grid":        (5, 5),
         "warehouse":   (0, 0),
         "robot_start": (0, 0),
         "pavilions": {
-            "P1": {"type": "rose", "pos": (1, 0), "needs": {"red": 1}},
+            "P1": {"type": "rose", "pos": (2, 2), "needs": {"red": 2}},
         },
     }
 
-    print("=== Milestone 3: goal check on tiny instance ===")
-    print("DFS finds first valid path (not optimal). Path/cost must be self-consistent.\n")
-    print("Generated states:")
+    print("=== Milestone 4: DFS end-to-end on Example A ===")
+    print("Optimal cost = 6.  DFS cost may be higher.\n")
+    print("--- Search tree ---")
     engine = FlowerEngine()
-    engine.reset(tiny)
+    engine.reset(example_A)
     engine.run()
+    print(f"\nTotal nodes explored: {len(engine._nodes)}")
